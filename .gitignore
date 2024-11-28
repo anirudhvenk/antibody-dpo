@@ -1,3 +1,5 @@
 data
 nohup.out
 .ipynb_checkpoints
+weights
+__pycache__
