@@ -6,7 +6,7 @@ from huggingface_hub import login
 from esm.models.esm3 import ESM3
 from trl import CPOConfig
 from trl.trainer.utils import DPODataCollatorWithPadding
-from utils import ESMCPOTrainer, ESMDataCollator
+from utils import ESMCPOTrainer
 from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
 
 login()
@@ -28,5 +28,6 @@ trainer = ESMCPOTrainer(
 
 train_dataloader = trainer.get_train_dataloader()
 batch = next(iter(train_dataloader))
+# print(batch)
 
-outputs = trainer.concatenated_forward(model=model, batch=batch)
+print(trainer.compute_loss(model=model, inputs=batch))
