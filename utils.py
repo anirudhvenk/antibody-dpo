@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
+import transformers
 
+from collections import defaultdict
+from packaging import version
 from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
 from torch.utils.data import Dataset
 from trl import CPOTrainer, CPOConfig
@@ -11,6 +15,23 @@ from trl.data_utils import maybe_extract_prompt, maybe_apply_chat_template
 from trl.trainer.utils import pad_to_length
 from typing import Any, Callable, Literal, Optional, Union, Dict
 from accelerate import PartialState
+from peft import PeftModel, get_peft_model, prepare_model_for_kbit_training
+from esm.sdk.api import ESMProtein, GenerationConfig
+
+class ESMDataCollator:
+    def __call__(self, features):
+        batch = {}
+        for batch_dict in features:
+            for k in batch_dict:
+                if k not in batch:
+                    batch[k] = []
+                batch[k].append(batch_dict[k])
+        
+        for k in batch:
+            if k.endswith(("_input_ids", "_labels")):
+                batch[k] = torch.tensor(batch[k])
+
+        return batch
 
 class ESMCPOTrainer(Trainer):
     def __init__(
@@ -28,11 +49,13 @@ class ESMCPOTrainer(Trainer):
         peft_config=None,
         compute_metrics=None,
     ):
+        if peft_config:
+            model = get_peft_model(model, peft_config)
+
         self.max_length = args.max_length
         self.generate_during_eval = args.generate_during_eval
         self.label_pad_token_id = args.label_pad_token_id
         self.padding_value = args.padding_value if args.padding_value is not None else processing_class.pad_token_id
-        # self.max_prompt_length = max_prompt_length
         self.truncation_mode = args.truncation_mode
         self.max_completion_length = args.max_completion_length
         self.processing_class = processing_class
@@ -42,13 +65,19 @@ class ESMCPOTrainer(Trainer):
         self.loss_type = args.loss_type
         self.cpo_alpha = args.cpo_alpha
 
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+
         with PartialState().local_main_process_first():
             train_dataset = train_dataset.map(
                 self.tokenize_row, 
                 num_proc=args.dataset_num_proc, 
                 load_from_cache_file=False
             )
-
+            eval_dataset = eval_dataset.map(
+                self.tokenize_row, 
+                num_proc=args.dataset_num_proc, 
+                load_from_cache_file=False
+            )
 
         super().__init__(
             model=model,
@@ -77,12 +106,10 @@ class ESMCPOTrainer(Trainer):
             rejected, truncation=False
         )
 
-        print(chosen_tokens["input_ids"])
-
         batch["chosen_input_ids"] = chosen_tokens["input_ids"]
         batch["rejected_input_ids"] = rejected_tokens["input_ids"]
-        batch["chosen_labels"] = [1] * len(chosen_tokens["input_ids"])
-        batch["rejected_labels"] = [0] * len(rejected_tokens["input_ids"])
+        batch["chosen_labels"] = chosen_tokens["input_ids"]
+        batch["rejected_labels"] = rejected_tokens["input_ids"]
 
         return batch
 
@@ -91,7 +118,7 @@ class ESMCPOTrainer(Trainer):
         batch: dict[str, Union[list, torch.LongTensor]],
         is_encoder_decoder: bool = False,
         label_pad_token_id: int = -100,
-        padding_value: int = 0,
+        padding_value: int = 1,
         device: Optional[torch.device] = None,
     ):
         concatenated_batch = {}
@@ -202,9 +229,6 @@ class ESMCPOTrainer(Trainer):
 
         loss_mask = labels != label_pad_token_id
 
-        # dummy token; we'll ignore the losses on these tokens later
-        labels[labels == label_pad_token_id] = 0
-
         per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
 
         if average_log_prob:
@@ -223,6 +247,7 @@ class ESMCPOTrainer(Trainer):
             batch,
             device=self.accelerator.device,
         )
+        len_chosen = batch["chosen_labels"].shape[0]
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             outputs = model(
@@ -240,8 +265,7 @@ class ESMCPOTrainer(Trainer):
             loss = loss_fct(logits, labels)
             return loss
 
-        labels = concatenated_batch["concatenated_labels"].clone()
-        labels = labels[:,97:107]
+        labels = concatenated_batch["concatenated_labels"][:,97:107].clone()
 
         if self.cpo_alpha == 0:
             nll_loss = torch.tensor(0.0).to(self.accelerator.device)
@@ -255,11 +279,11 @@ class ESMCPOTrainer(Trainer):
             label_pad_token_id=self.label_pad_token_id
         )
 
-        chosen_logps = all_logps
-        rejected_logps = all_logps
+        chosen_logps = all_logps[:len_chosen]
+        rejected_logps = all_logps[len_chosen:]
 
-        chosen_logits = all_logits
-        rejected_logits = all_logits
+        chosen_logits = all_logits[:len_chosen]
+        rejected_logits = all_logits[len_chosen:]
 
         return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, nll_loss)
     
@@ -280,8 +304,6 @@ class ESMCPOTrainer(Trainer):
             policy_rejected_logits,
             policy_nll_loss,
         ) = forward_output[:5]
-        # if self.aux_loss_enabled:
-        #     aux_loss = forward_output[5]
 
         losses, chosen_rewards, rejected_rewards = self.cpo_loss(
             policy_chosen_logps,
@@ -302,9 +324,6 @@ class ESMCPOTrainer(Trainer):
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
         metrics[f"{prefix}nll_loss"] = policy_nll_loss.detach().mean().cpu()
 
-        # if self.aux_loss_enabled:
-        #     loss += self.aux_loss_coef * aux_loss
-
         return loss, metrics
 
     def compute_loss(
@@ -314,20 +333,115 @@ class ESMCPOTrainer(Trainer):
         return_outputs=False,
         num_items_in_batch=None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, torch.Tensor]]]:
-        # if not self.use_dpo_data_collator:
-        #     warnings.warn(
-        #         "compute_loss is only implemented for DPODataCollatorWithPadding, and you passed a datacollator that is different than "
-        #         "DPODataCollatorWithPadding - you might see unexpected behavior. Alternatively, you can implement your own prediction_step method if you are using a custom data collator"
-        #     )
-
-        # compute_loss_context_manager = torch.amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
-
-        # with compute_loss_context_manager:
         loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
 
         # force log the metrics
-        # self.store_metrics(metrics, train_eval="train")
+        self.store_metrics(metrics, train_eval="train")
 
         if return_outputs:
             return (loss, metrics)
         return loss
+    
+    def generate_from_model(self, model) -> str:
+        prompt = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGKGLEWVARIYPTNGYTRYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYC__________WGQGTLVTVSS"
+        protein = ESMProtein(sequence=prompt)
+        protein = model.generate(protein, GenerationConfig(track="sequence", num_steps=4, temperature=0.1))
+
+        return protein.sequence[96:106]
+
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
+        if ignore_keys is None:
+            if hasattr(model, "config"):
+                ignore_keys = getattr(model.config, "keys_to_ignore_at_inference", [])
+            else:
+                ignore_keys = []
+
+        with torch.no_grad():
+            loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="eval")
+
+        # force log the metrics
+        self.store_metrics(metrics, train_eval="eval")
+
+        if prediction_loss_only:
+            return (loss.detach(), None, None)
+
+        # logits for the chosen and rejected samples from model
+        logits_dict = {
+            "eval_logits/chosen": metrics["eval_logits/chosen"],
+            "eval_logits/rejected": metrics["eval_logits/rejected"],
+        }
+        logits = tuple(v.unsqueeze(dim=0) for k, v in logits_dict.items() if k not in ignore_keys)
+        logits = torch.stack(logits).mean(axis=1).to(self.accelerator.device)
+        labels = torch.zeros(logits.shape[0], device=self.accelerator.device)
+
+        return (loss.detach(), logits, labels)
+    
+    def store_metrics(self, metrics: dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
+        for key, value in metrics.items():
+            self._stored_metrics[train_eval][key].append(value)
+
+    def evaluation_loop(
+        self,
+        dataloader,
+        description,
+        prediction_loss_only=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        """
+        Overriding built-in evaluation loop to store metrics for each batch.
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+
+        # Sample and save to game log if requested (for one batch to save time)
+        if self.generate_during_eval:
+            # Generate random indices within the range of the total number of samples
+
+            generated_sequences = [self.generate_from_model(self.model) for _ in range(self.args.eval_batch_size)]
+
+            self.log(
+                {
+                    "seq_log": wandb.Table(
+                        columns=["Sequences"],
+                        rows=[[seq] for seq in generated_sequences]
+                    )
+                }
+            )
+            self.state.log_history.pop()
+
+        # Base evaluation
+        initial_output = super().evaluation_loop(
+            dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
+        )
+
+        return initial_output
+
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        """
+        Log `logs` on the various objects watching training, including stored metrics.
+
+        Args:
+            logs (`dict[str, float]`):
+                The values to log.
+            start_time (`float` or `None`, *optional*, defaults to `None`):
+                Start time of the training.
+        """
+        # logs either has 'loss' or 'eval_loss'
+        train_eval = "train" if "loss" in logs else "eval"
+        # Add averaged stored metrics to logs
+        for key, metrics in self._stored_metrics[train_eval].items():
+            logs[key] = torch.tensor(metrics).mean().item()
+        del self._stored_metrics[train_eval]
+
+        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
+            return super().log(logs, start_time)
+        else:  # transformers<=4.46
+            return super().log(logs)
