@@ -10,11 +10,16 @@ from trl.trainer.utils import DPODataCollatorWithPadding
 from utils import ESMCPOTrainer, ESMDataCollator
 from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
 from peft import LoraConfig, PeftConfig
+from datetime import datetime
 
 # DDP is not working for some reason (cuda internal error)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-login()
+os.environ["WANDB_PROJECT"] = "antibody-dpo"
+
+timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+# login()
 model = ESM3.from_pretrained("esm3-open")
 
 config = create_config()
@@ -45,11 +50,15 @@ config = CPOConfig(
     loss_type=config.loss_type,
     cpo_alpha=config.alpha,
     beta=config.beta,
-    output_dir="weights",
+    save_strategy="steps",
+    save_steps=0.1,
+    save_safetensors=False,
+    output_dir=f"weights/{timestamp}",
     remove_unused_columns=False,
     generate_during_eval=True,
     eval_strategy="steps",
-    eval_steps=0.1
+    eval_steps=0.1,
+    run_name=timestamp
 )
 
 trainer = ESMCPOTrainer(

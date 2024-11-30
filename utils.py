@@ -71,12 +71,12 @@ class ESMCPOTrainer(Trainer):
             train_dataset = train_dataset.map(
                 self.tokenize_row, 
                 num_proc=args.dataset_num_proc, 
-                load_from_cache_file=False
+                load_from_cache_file=True
             )
             eval_dataset = eval_dataset.map(
                 self.tokenize_row, 
                 num_proc=args.dataset_num_proc, 
-                load_from_cache_file=False
+                load_from_cache_file=True
             )
 
         super().__init__(
@@ -334,6 +334,7 @@ class ESMCPOTrainer(Trainer):
         num_items_in_batch=None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, torch.Tensor]]]:
         loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
+        print(metrics)
 
         # force log the metrics
         self.store_metrics(metrics, train_eval="train")
@@ -405,13 +406,13 @@ class ESMCPOTrainer(Trainer):
         if self.generate_during_eval:
             # Generate random indices within the range of the total number of samples
 
-            generated_sequences = [self.generate_from_model(self.model) for _ in range(self.args.eval_batch_size)]
+            generated_sequence = self.generate_from_model(self.model)
 
             self.log(
                 {
                     "seq_log": wandb.Table(
                         columns=["Sequences"],
-                        rows=[[seq] for seq in generated_sequences]
+                        rows=[[generated_sequence]]
                     )
                 }
             )
