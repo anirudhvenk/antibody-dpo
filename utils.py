@@ -249,11 +249,15 @@ class ESMCPOTrainer(Trainer):
         )
         len_chosen = batch["chosen_labels"].shape[0]
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            outputs = model(
-                sequence_tokens=concatenated_batch["concatenated_input_ids"]
-            )
-        all_logits = outputs.sequence_logits[:,97:107]
+        if type(model).__name__ == "EsmForMaskedLM":
+            outputs = model(concatenated_batch["concatenated_input_ids"])
+            all_logits = outputs.logits[:,97:107]
+        else:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                outputs = model(
+                    sequence_tokens=concatenated_batch["concatenated_input_ids"]
+                )
+            all_logits = outputs.sequence_logits[:,97:107]
 
         def cross_entropy_loss(logits, labels):
             # Flatten the tokens
@@ -334,7 +338,6 @@ class ESMCPOTrainer(Trainer):
         num_items_in_batch=None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, torch.Tensor]]]:
         loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
-        print(metrics)
 
         # force log the metrics
         self.store_metrics(metrics, train_eval="train")
@@ -344,6 +347,13 @@ class ESMCPOTrainer(Trainer):
         return loss
     
     def generate_from_model(self, model) -> str:
+        # if type(model).__name__ == "EsmForMaskedLM":
+        #     prompt = f"EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGKGLEWVARIYPTNGYTRYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYC{"".join(["<MASK>" for _ in range(10)])}WGQGTLVTVSS"
+        #     inputs = self.processing_class(prompt, return_tensors="pt")
+        #     with torch.no_grad():
+        #         logits = model(**inputs).logits
+
+        # else:
         prompt = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGKGLEWVARIYPTNGYTRYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYC__________WGQGTLVTVSS"
         protein = ESMProtein(sequence=prompt)
         protein = model.generate(protein, GenerationConfig(track="sequence", num_steps=4, temperature=0.1))
