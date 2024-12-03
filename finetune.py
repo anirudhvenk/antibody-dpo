@@ -13,7 +13,7 @@ from peft import LoraConfig, PeftConfig
 from datetime import datetime
 
 # DDP is not working for some reason (cuda internal error)
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 os.environ["WANDB_PROJECT"] = "antibody-dpo"
 
@@ -51,13 +51,13 @@ config = CPOConfig(
     cpo_alpha=config.alpha,
     beta=config.beta,
     save_strategy="steps",
-    save_steps=0.05,
+    save_steps=0.1,
     save_safetensors=False,
     output_dir=f"weights/{timestamp}",
     remove_unused_columns=False,
     generate_during_eval=True,
     eval_strategy="steps",
-    eval_steps=1,
+    eval_steps=0.1,
     run_name=timestamp
 )
 
