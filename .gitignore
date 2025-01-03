@@ -4,3 +4,4 @@ nohup.out
 weights
 __pycache__
 wandb
+outputs
